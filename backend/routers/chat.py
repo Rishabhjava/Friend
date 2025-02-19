@@ -22,6 +22,7 @@ from utils.llm import initial_chat_message
 from utils.other import endpoints as auth, storage
 from utils.other.chat_file import FileChatTool
 from utils.retrieval.graph import execute_graph_chat, execute_graph_chat_stream
+from utils.retrieval.twitter_graph import execute_twitter_graph_chat_stream
 
 router = APIRouter()
 fc = FileChatTool()
@@ -415,58 +416,47 @@ def send_message_with_twitter(
         data: SendMessageRequest, plugin_id: Optional[str] = None, uid: str = Depends(auth.get_current_user_uid)
 ):
     print('send_message_with_twitter', data.text, plugin_id, uid)
+
     if plugin_id in ['null', '']:
         plugin_id = None
-    
-    # Create and add the user's message
+
+    # get chat session
+    chat_session = chat_db.get_chat_session(uid, plugin_id=plugin_id)
+    chat_session = ChatSession(**chat_session) if chat_session else None
+
     message = Message(
-        id=str(uuid.uuid4()), 
-        text=data.text, 
-        created_at=datetime.now(timezone.utc), 
-        sender='human', 
-        type='text',
+        id=str(uuid.uuid4()), text=data.text, created_at=datetime.now(timezone.utc), sender='human', type='text',
         plugin_id=plugin_id
     )
+
+    if chat_session:
+        message.chat_session_id = chat_session.id
+        chat_db.add_message_to_chat_session(uid, chat_session.id, message.id)
+
     chat_db.add_message(uid, message.dict())
 
-    # Get app info
     app = get_available_app_by_id(plugin_id, uid)
     app = App(**app) if app else None
+
     app_id = app.id if app else None
 
-    # Get recent messages and Twitter DMs
     messages = list(reversed([Message(**msg) for msg in chat_db.get_messages(uid, limit=10, plugin_id=plugin_id)]))
+
+    # Get Twitter DMs
     twitter_dms = get_twitter_dms(uid)
-    
-    # Format Twitter DMs as context
     twitter_context = ""
     if twitter_dms:
-        twitter_context = "Recent Twitter DM conversations:\n"
+        twitter_context = "Recent Twitter DMs:\n\n"
         for dm in twitter_dms:
-            sender_info = dm.get('sender_info', {})
-            twitter_context += f"From @{sender_info.get('username', 'unknown')}: {dm.get('text', '')}\n"
+            sender = dm.get('sender_username', 'unknown')
+            text = dm.get('text', '')
+            timestamp = dm.get('created_at', '')
+            twitter_context += f"@{sender} ({timestamp}): {text}\n"
     else:
         twitter_context = "No recent Twitter DMs available."
 
     def process_message(response: str, callback_data: dict):
-        memories = callback_data.get('memories_found', [])
         ask_for_nps = callback_data.get('ask_for_nps', False)
-
-        # cited extraction
-        cited_memory_idxs = {int(i) for i in re.findall(r'\[(\d+)\]', response)}
-        if len(cited_memory_idxs) > 0:
-            response = re.sub(r'\[\d+\]', '', response)
-        memories = [memories[i - 1] for i in cited_memory_idxs if 0 < i and i <= len(memories)]
-
-        memories_id = []
-        if memories:
-            converted_memories = []
-            for m in memories[:5]:
-                if isinstance(m, dict):
-                    converted_memories.append(Memory(**m))
-                else:
-                    converted_memories.append(m)
-            memories_id = [m.id for m in converted_memories]
 
         ai_message = Message(
             id=str(uuid.uuid4()),
@@ -475,10 +465,12 @@ def send_message_with_twitter(
             sender='ai',
             plugin_id=app_id,
             type='text',
-            memories_id=memories_id,
         )
+        if chat_session:
+            ai_message.chat_session_id = chat_session.id
+            chat_db.add_message_to_chat_session(uid, chat_session.id, ai_message.id)
+
         chat_db.add_message(uid, ai_message.dict())
-        ai_message.memories = [MessageMemory(**m) for m in (memories if len(memories) < 5 else memories[:5])]
         if app_id:
             record_app_usage(uid, app_id, UsageHistoryType.chat_message_sent, message_id=ai_message.id)
 
@@ -486,10 +478,7 @@ def send_message_with_twitter(
 
     async def generate_stream():
         callback_data = {}
-        # Add Twitter context to the conversation
-        callback_data['twitter_context'] = twitter_context
-        
-        async for chunk in execute_graph_chat_stream(uid, messages, app, cited=True, callback_data=callback_data):
+        async for chunk in execute_twitter_graph_chat_stream(uid, messages, twitter_context, app, cited=True, callback_data=callback_data):
             if chunk:
                 data = chunk.replace("\n", "__CRLF__")
                 yield f'{data}\n\n'
@@ -507,6 +496,7 @@ def send_message_with_twitter(
         generate_stream(),
         media_type="text/event-stream"
     )
+
 @router.post('/v1/files', response_model=List[FileChat], tags=['chat'])
 def upload_file_chat(files: List[UploadFile] = File(...), uid: str = Depends(auth.get_current_user_uid)):
     thumbs_name = []
